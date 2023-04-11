@@ -27,6 +27,14 @@ def test_episode(
     result = collector.collect(n_episode=n_episode)
     if reward_metric:
         rew = reward_metric(result["rews"])
+        n_env, n_agent = rew.shape
+        if n_agent > 1:
+            update_dict = {}
+            for i in range(n_agent):
+                update_dict[f"rews_{i}"] = rew[:, i]
+                update_dict[f"rew_{i}"] = rew[:, i].mean()
+                update_dict[f"rew_std_{i}"] = rew[:, i].std()
+            result.update(**update_dict)
         result.update(rews=rew, rew=rew.mean(), rew_std=rew.std())
     if logger and global_step is not None:
         logger.log_test_data(result, global_step)

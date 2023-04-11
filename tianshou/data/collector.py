@@ -17,6 +17,7 @@ from tianshou.data import (
 from tianshou.data.batch import _alloc_by_keys_diff
 from tianshou.env import BaseVectorEnv, DummyVectorEnv
 from tianshou.policy import BasePolicy
+from copy import deepcopy as dcp
 
 
 class Collector(object):
@@ -258,6 +259,8 @@ class Collector(object):
         episode_lens = []
         episode_start_indices = []
 
+        if self.reward_update == "last_update":
+            self.data_hold = {}
         while True:
             assert len(self.data) == len(ready_env_ids)
             # restore the state: if the last state is None, it won't store
@@ -295,8 +298,7 @@ class Collector(object):
             obs_next, rew, terminated, truncated, info = self.env.step(
                 action_remap, ready_env_ids  # type: ignore
             )
-            if self.reward_update == "last_update":
-                pass
+
             done = np.logical_or(terminated, truncated)
 
             self.data.update(
@@ -325,45 +327,118 @@ class Collector(object):
                 if render > 0 and not np.isclose(render, 0):
                     time.sleep(render)
 
-            # add data into the buffer
-            ptr, ep_rew, ep_len, ep_idx = self.buffer.add(
-                self.data, buffer_ids=ready_env_ids
-            )
-
-            # collect statistics
-            step_count += len(ready_env_ids)
-
-            if np.any(done):
-                env_ind_local = np.where(done)[0]
-                env_ind_global = ready_env_ids[env_ind_local]
-                episode_count += len(env_ind_local)
-                episode_lens.append(ep_len[env_ind_local])
-                episode_rews.append(ep_rew[env_ind_local])
-                episode_start_indices.append(ep_idx[env_ind_local])
-                # now we copy obs_next to obs, but since there might be
-                # finished episodes, we have to reset finished envs first.
-                self._reset_env_with_ids(
-                    env_ind_local, env_ind_global, gym_reset_kwargs
+            if self.reward_update == "last_update":
+                assert (
+                    self.data.obs_next.agent_id == self.data.obs_next.agent_id[0]
+                ).all() and (
+                    self.data.obs.agent_id == self.data.obs.agent_id[0]
+                ).all(), (
+                    "only support the same activated agent in different parallel envs"
                 )
-                for i in env_ind_local:
-                    self._reset_state(i)
+                if not (self.data.obs_next.agent_id[0] == "player_0"):
+                    # if this is not the last agent:
+                    self.data_hold[self.data.obs.agent_id[0]] = dcp(
+                        self.data
+                    )  # put all these data into a buffer
+                    self.data.obs = self.data.obs_next
+                    continue
+                else:
+                    count = 0
+                    for agent_id, data in self.data_hold.items():
+                        # agent_id_n = int(agent_id.replace("player_", ""))
+                        # self.data_hold[agent_id].rew = self.data.rew[
+                        #     :, agent_id_n
+                        # ] # sync the reward
+                        self.data_hold[agent_id].rew = self.data.rew  # sync the reward
+                        ptr, ep_rew, ep_len, ep_idx = self.buffer.add(
+                            self.data_hold[agent_id], buffer_ids=ready_env_ids
+                        )  # add data related to previos agents into the buffer
+                        count += 1
+                    # agent_id_n = int(self.data.obs.agent_id[0].replace("player_", ""))
+                    # self.data.rew = self.data.rew[:, agent_id_n] # get the specific reward
+                    # add data of the last agent into the buffer
+                    ptr, ep_rew, ep_len, ep_idx = self.buffer.add(
+                        self.data, buffer_ids=ready_env_ids
+                    )
+                    # clear the data holder
+                    self.data_hold = {}
+                    step_count += len(ready_env_ids) * (count + 1)
+                    if np.any(done):
+                        env_ind_local = np.where(done)[0]
+                        env_ind_global = ready_env_ids[env_ind_local]
+                        episode_count += len(env_ind_local)
+                        episode_lens.append(ep_len[env_ind_local])
+                        episode_rews.append(ep_rew[env_ind_local])
+                        episode_start_indices.append(ep_idx[env_ind_local])
+                        # now we copy obs_next to obs, but since there might be
+                        # finished episodes, we have to reset finished envs first.
+                        self._reset_env_with_ids(
+                            env_ind_local, env_ind_global, gym_reset_kwargs
+                        )
+                        for i in env_ind_local:
+                            self._reset_state(i)
 
-                # remove surplus env id from ready_env_ids
-                # to avoid bias in selecting environments
-                if n_episode:
-                    surplus_env_num = len(ready_env_ids) - (n_episode - episode_count)
-                    if surplus_env_num > 0:
-                        mask = np.ones_like(ready_env_ids, dtype=bool)
-                        mask[env_ind_local[:surplus_env_num]] = False
-                        ready_env_ids = ready_env_ids[mask]
-                        self.data = self.data[mask]
+                        # remove surplus env id from ready_env_ids
+                        # to avoid bias in selecting environments
+                        if n_episode:
+                            surplus_env_num = len(ready_env_ids) - (
+                                n_episode - episode_count
+                            )
+                            if surplus_env_num > 0:
+                                mask = np.ones_like(ready_env_ids, dtype=bool)
+                                mask[env_ind_local[:surplus_env_num]] = False
+                                ready_env_ids = ready_env_ids[mask]
+                                self.data = self.data[mask]
+                    if (n_step and step_count >= n_step) or (
+                        n_episode and episode_count >= n_episode
+                    ):
+                        break
+            elif self.reward_update is None or self.reward_update == "":
+                # add data into the buffer
+                ptr, ep_rew, ep_len, ep_idx = self.buffer.add(
+                    self.data, buffer_ids=ready_env_ids
+                )
 
-            self.data.obs = self.data.obs_next
+                # collect statistics
+                step_count += len(ready_env_ids)
 
-            if (n_step and step_count >= n_step) or (
-                n_episode and episode_count >= n_episode
-            ):
-                break
+                if np.any(done):
+                    env_ind_local = np.where(done)[0]
+                    env_ind_global = ready_env_ids[env_ind_local]
+                    episode_count += len(env_ind_local)
+                    episode_lens.append(ep_len[env_ind_local])
+                    episode_rews.append(ep_rew[env_ind_local])
+                    episode_start_indices.append(ep_idx[env_ind_local])
+                    # now we copy obs_next to obs, but since there might be
+                    # finished episodes, we have to reset finished envs first.
+                    self._reset_env_with_ids(
+                        env_ind_local, env_ind_global, gym_reset_kwargs
+                    )
+                    for i in env_ind_local:
+                        self._reset_state(i)
+
+                    # remove surplus env id from ready_env_ids
+                    # to avoid bias in selecting environments
+                    if n_episode:
+                        surplus_env_num = len(ready_env_ids) - (
+                            n_episode - episode_count
+                        )
+                        if surplus_env_num > 0:
+                            mask = np.ones_like(ready_env_ids, dtype=bool)
+                            mask[env_ind_local[:surplus_env_num]] = False
+                            ready_env_ids = ready_env_ids[mask]
+                            self.data = self.data[mask]
+
+                self.data.obs = self.data.obs_next
+
+                if (n_step and step_count >= n_step) or (
+                    n_episode and episode_count >= n_episode
+                ):
+                    break
+            else:
+                raise NotImplementedError(
+                    "reward_update only support `last_update` or None"
+                )
 
         # generate statistics
         self.collect_step += step_count
